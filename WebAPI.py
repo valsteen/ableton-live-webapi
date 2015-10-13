@@ -16,6 +16,7 @@ from _Framework.ControlSurface import ControlSurface
 
 PUSH_ADDRESS = "tcp://127.0.0.1:5554"
 PULL_ADDRESS = "tcp://127.0.0.1:5553"
+PUB_ADDRESS = "tcp://127.0.0.1:5552"
 
 
 class WebAPI(ControlSurface):
@@ -67,23 +68,22 @@ class WebAPI(ControlSurface):
                 except:
                     # not all listeners are mapped directly to a property. just callback without any value
                     value = None
-                self.push_socket.send(simplejson.dumps({'id': _id, 'attribute': attr, 'value': value}))
+                self.pub_socket.send(simplejson.dumps({'id': _id, 'attribute': attr, 'value': value}))
         self.updated_queue = {}
 
     rconsole_started = False
 
-    def zmq_out(self, message):
-        self.push_socket.send(message)
-
     def receive_midi(self, midi_bytes):
         try:
+            self.log_message("wake up")
             if len(midi_bytes) == 2:
                 while True:
                     try:
-                        clientId, req = self.pull_socket.recv_multipart()
+                        req = self.pull_socket.recv()
+                        self.log_message(req)
                     except zmq.ZMQError:
                         break
-                    self.respond(clientId, simplejson.loads(req), self.zmq_out)
+                    self.respond(simplejson.loads(req), self.push_socket.send)
         except Exception, e:
             self.log_message(repr(e))
 
@@ -127,7 +127,7 @@ class WebAPI(ControlSurface):
         event.wait()
         return result_holder['error']
 
-    def respond(self, clientId, req, cb):
+    def respond(self, req, cb):
         try:
             # Live API doesn't like lists. Overriding JSON Decoder isn't useful: overriding array parsing isn't possible
             def convert_objects(arg):
@@ -143,11 +143,10 @@ class WebAPI(ControlSurface):
                 return arg
 
             result = self.request(convert_objects(req))
-            result["clientId"] = clientId
             cb(simplejson.dumps(result))
         except Exception, e:
             self.log_message(repr(e))
-            cb(simplejson.dumps({'error': repr(e), "clientId": clientId}))
+            cb(simplejson.dumps({'error': repr(e), 'messageId': req["messageId"]}))
 
     def request(self, req):
         try:
@@ -168,8 +167,7 @@ class WebAPI(ControlSurface):
             elif req["method"] == "BATCH":
                 result = []
                 for command in req["commands"]:
-                    command[1]["method"] = command[0]
-                    result.append(self.request(command[1]))
+                    result.append(self.request(command))
             else:
                 if "id" in req:
                     attr = req.get("attribute")
@@ -286,7 +284,7 @@ class WebAPI(ControlSurface):
         self.logger = logging.getLogger("ableton")
         self.logger.setLevel(logging.DEBUG)
         self.logger.addHandler(logfile)
-        self.logger.debug("connected")
+        self.logger.debug("WebAPI connected")
 
         self.listeners = {}
 
@@ -296,16 +294,24 @@ class WebAPI(ControlSurface):
         self.updated_queue = {}
         self.references = {}
 
-        self.context = zmq.Context.instance()
+        try:
+            self.context = zmq.Context.instance()
 
-        self.push_socket = self.context.socket(zmq.PUSH)
-        self.push_socket.bind(PUSH_ADDRESS)
-        self.push_socket.setsockopt(zmq.LINGER, 10)
+            self.push_socket = self.context.socket(zmq.PUSH)
+            self.push_socket.setsockopt(zmq.LINGER, 10)
+            self.push_socket.bind(PUSH_ADDRESS)
 
-        self.pull_socket = self.context.socket(zmq.PULL)
-        self.pull_socket.setsockopt(zmq.LINGER, 10)
-        self.pull_socket.bind(PULL_ADDRESS)
-        self.pull_socket.RCVTIMEO = 5
+            self.pull_socket = self.context.socket(zmq.PULL)
+            self.pull_socket.setsockopt(zmq.LINGER, 10)
+            self.pull_socket.setsockopt(zmq.RCVTIMEO, 5)
+            self.pull_socket.bind(PULL_ADDRESS)
+
+            self.pub_socket = self.context.socket(zmq.PUB)
+            self.pub_socket.setsockopt(zmq.LINGER, 10)
+            self.pub_socket.bind(PUB_ADDRESS)
+
+        except Exception, e:
+            self.log_message(e)
 
         ControlSurface.__init__(self, c_instance)
 
@@ -316,5 +322,6 @@ class WebAPI(ControlSurface):
         self.console_lock.set()
         self.push_socket.close()
         self.pull_socket.close()
+        self.pub_socket.close()
         self.context.term()
         ControlSurface.disconnect(self)
