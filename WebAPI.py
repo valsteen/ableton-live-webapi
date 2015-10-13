@@ -75,7 +75,6 @@ class WebAPI(ControlSurface):
 
     def receive_midi(self, midi_bytes):
         try:
-            self.log_message("wake up")
             if len(midi_bytes) == 2:
                 while True:
                     try:
