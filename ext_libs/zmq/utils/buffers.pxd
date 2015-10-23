@@ -137,6 +137,7 @@ cdef inline object asbuffer(object ob, int writable, int format,
     cdef Py_buffer view
     cdef int flags = PyBUF_SIMPLE
     cdef int mode = 0
+    
     bfmt = None
 
     mode = check_buffer(ob)
@@ -182,6 +183,7 @@ cdef inline object asbuffer(object ob, int writable, int format,
     if base: base[0] = <void *>bptr
     if size: size[0] = <Py_ssize_t>blen
     if itemsize: itemsize[0] = <Py_ssize_t>bitemlen
+    
     if PY_MAJOR_VERSION >= 3 and bfmt is not None:
         return bfmt.decode('ascii')
     return bfmt

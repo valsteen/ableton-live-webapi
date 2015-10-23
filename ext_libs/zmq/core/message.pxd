@@ -50,4 +50,4 @@ cdef class Message:
     cdef Message fast_copy(self) # Create shallow copy of Message object.
     cdef object _getbuffer(self) # Construct self._buffer.
 
-cdef inline object copy_zmq_msg_bytes(zmq_msg_t *zmq_msg)
+cdef object copy_zmq_msg_bytes(zmq_msg_t *zmq_msg)
