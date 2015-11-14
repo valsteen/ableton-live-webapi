@@ -1,11 +1,14 @@
-from __future__ import with_statement
+﻿import asynchat
 import logging
+import socket
 
 import sys
+import os
 import threading
-import zmq
 import simplejson
 import time
+import asyncore
+import heapq
 
 
 # Import Live libraries
@@ -13,10 +16,89 @@ import Live
 import types
 from _Framework.ControlSurface import ControlSurface
 
+REQUEST_PORT = 5553  # request and replies ( pipeline, not interactive )
+PUB_PORT = 5552  # to send updates
 
-PUSH_ADDRESS = "tcp://127.0.0.1:5554"
-PULL_ADDRESS = "tcp://127.0.0.1:5553"
-PUB_ADDRESS = "tcp://127.0.0.1:5552"
+logger = logging.getLogger("WebAPI")
+
+class BaseHandler(asynchat.async_chat):
+    def __init__(self, sock, map, server):
+        """
+
+        :type server: BaseServer
+        """
+
+        # we skip asynchat constructor because of inconsistencies in asynchat for python2.5
+        self.ac_in_buffer = ''
+        self.ac_out_buffer = ''
+        self.producer_fifo = asynchat.fifo()
+        asyncore.dispatcher.__init__(self, sock, map)
+        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.set_terminator('\n')
+        self.buffer = []
+        self.server = server
+
+    def handle_close(self):
+        self.server.event_happened = True
+        if self in self.server.clients:
+            self.server.clients.remove(self)
+        self.close()
+
+    def handle_write(self):
+        self.server.event_happened = True
+        return asynchat.async_chat.handle_write(self)
+
+    def handle_read(self):
+        self.server.event_happened = True
+        asynchat.async_chat.handle_read(self)
+        logger.error(self.ac_in_buffer)
+
+    def collect_incoming_data(self, data):
+        self.buffer.append(data)
+
+    def found_terminator(self):
+        msg = ''.join(self.buffer)
+        self.buffer = []
+        self.server.message_callback(self, msg)
+
+    def log(self, message):
+        logger.error(message)
+
+    def log_info(self, message, type='info'):
+        logger.error(message)
+
+
+class BaseServer(asyncore.dispatcher):
+    def __init__(self, host, port, map, handler_class, message_callback=None):
+        asyncore.dispatcher.__init__(self, map=map)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.bind((host, port))
+        self.listen(5)
+        self.handler_class = handler_class
+        self.message_callback = message_callback
+        self.clients = []
+
+    def handle_accept(self):
+        pair = self.accept()
+        if pair is not None:
+            sock, addr = pair
+            self.clients.append(self.handler_class(sock, self._map, self))
+
+    def broadcast(self, msg):
+        for client in self.clients:
+            client.send(msg + client.terminator)
+
+    def log(self, message):
+        logger.error(message)
+
+    def log_info(self, message, type='info'):
+        logger.error(message)
+
+    def close(self):
+        for client in self.clients:
+            client.close()
+        asyncore.dispatcher.close(self)
 
 
 class WebAPI(ControlSurface):
@@ -68,21 +150,39 @@ class WebAPI(ControlSurface):
                 except:
                     # not all listeners are mapped directly to a property. just callback without any value
                     value = None
-                self.pub_socket.send(simplejson.dumps({'id': _id, 'attribute': attr, 'value': value}))
+                self.updates_server.broadcast(simplejson.dumps({'id': _id, 'attribute': attr, 'value': value}))
+
         self.updated_queue = {}
 
     rconsole_started = False
 
+    def request_loop(self, retry=10):
+        self.loop_scheduled = False
+        passed = False
+
+        while True:
+            self.request_server.event_happened = self.updates_server.event_happened = False
+            asyncore.loop(0, map=self.sockets_map, count=1)
+            if not self.request_server.event_happened and not self.updates_server.event_happened:
+                if not passed and retry > 0:  # nothing found at first pass, maybe we missed messages, try again
+                    self.loop_scheduled = True
+                    self.schedule_message(10, lambda: self.request_loop(retry - 1))
+                break
+            passed = True
+            # loop as long as something happened
+
+    def schedule_loop(self, delay=10):
+        # don't schedule a loop if one is already scheduled
+        if not getattr(self, "loop_scheduled", False):
+            self.schedule_message(delay, self.request_loop)
+            self.loop_scheduled = True
+
     def receive_midi(self, midi_bytes):
         try:
             if len(midi_bytes) == 2:
-                while True:
-                    try:
-                        req = self.pull_socket.recv()
-                        self.log_message(req)
-                    except zmq.ZMQError:
-                        break
-                    self.respond(simplejson.loads(req), self.push_socket.send)
+                # otherwise the messages are not yet there
+                self.schedule_loop(1)
+
         except Exception, e:
             self.log_message(repr(e))
 
@@ -245,14 +345,17 @@ class WebAPI(ControlSurface):
                 # references, fortunately this is used only at initialization
 
                 if hash(result) in self.references and self.references[hash(result)] == result:
-                    return {'result': {'id': hash(result), 'type': result.__class__.__name__}, 'messageId': req.get("messageId") }
+                    return {'result': {'id': hash(result), 'type': result.__class__.__name__},
+                            'messageId': req.get("messageId")}
 
                 for _id, ref in self.references.items():
                     if ref == result:
-                        return {'result': {'id': _id, 'type': result.__class__.__name__}, 'messageId': req.get("messageId")}
+                        return {'result': {'id': _id, 'type': result.__class__.__name__},
+                                'messageId': req.get("messageId")}
 
                 self.references[hash(result)] = result
-                return {'result': {'id': hash(result), 'type': result.__class__.__name__}, 'messageId': req.get("messageId")}
+                return {'result': {'id': hash(result), 'type': result.__class__.__name__},
+                        'messageId': req.get("messageId")}
         except Exception, e:
             self.log_message(repr(e))
             return {'error': repr(e), 'messageId': req.get("messageId")}
@@ -275,15 +378,18 @@ class WebAPI(ControlSurface):
     def unpause(self):
         self.console_lock.set()
 
+    def received_request(self, client, msg):
+        try:
+            self.respond(simplejson.loads(msg), lambda message: client.send(message + "\n"))
+        except Exception, e:
+            self.log_message(repr(e))
+
     def __init__(self, c_instance):
-        logfile = logging.FileHandler('/tmp/abletonwebapi.log')
-        logfile.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        logfile.setFormatter(formatter)
-        self.logger = logging.getLogger("ableton")
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.addHandler(logfile)
-        self.logger.debug("WebAPI connected")
+        self.logger = logging.getLogger("WebAPI")
+        self.sockets_map = {}
+        self.request_server = BaseServer("127.0.0.1", REQUEST_PORT, self.sockets_map, BaseHandler,
+                                         self.received_request)
+        self.updates_server = BaseServer("127.0.0.1", PUB_PORT, self.sockets_map, BaseHandler)
 
         self.listeners = {}
 
@@ -293,25 +399,6 @@ class WebAPI(ControlSurface):
         self.updated_queue = {}
         self.references = {}
 
-        try:
-            self.context = zmq.Context.instance()
-
-            self.push_socket = self.context.socket(zmq.PUSH)
-            self.push_socket.setsockopt(zmq.LINGER, 10)
-            self.push_socket.bind(PUSH_ADDRESS)
-
-            self.pull_socket = self.context.socket(zmq.PULL)
-            self.pull_socket.setsockopt(zmq.LINGER, 10)
-            self.pull_socket.setsockopt(zmq.RCVTIMEO, 5)
-            self.pull_socket.bind(PULL_ADDRESS)
-
-            self.pub_socket = self.context.socket(zmq.PUB)
-            self.pub_socket.setsockopt(zmq.LINGER, 10)
-            self.pub_socket.bind(PUB_ADDRESS)
-
-        except Exception, e:
-            self.log_message(e)
-
         ControlSurface.__init__(self, c_instance)
 
     def log_message(self, *message):
@@ -319,8 +406,6 @@ class WebAPI(ControlSurface):
 
     def disconnect(self):
         self.console_lock.set()
-        self.push_socket.close()
-        self.pull_socket.close()
-        self.pub_socket.close()
-        self.context.term()
+        self.request_server.close()
+        self.updates_server.close()
         ControlSurface.disconnect(self)
